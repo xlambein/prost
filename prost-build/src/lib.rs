@@ -128,7 +128,10 @@ use std::process::Command;
 
 use log::trace;
 use prost::Message;
-use prost_types::{FileDescriptorProto, FileDescriptorSet};
+use prost_types::{
+    DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+    FileDescriptorProto, FileDescriptorSet, OneofDescriptorProto,
+};
 
 pub use crate::ast::{Comments, Method, Service};
 use crate::code_generator::CodeGenerator;
@@ -216,6 +219,12 @@ impl Default for BytesType {
     }
 }
 
+type MessageAttributeFn = Box<dyn Fn(&mut dyn fmt::Write, &str, &DescriptorProto)>;
+type EnumAttributeFn = Box<dyn Fn(&mut dyn fmt::Write, &str, &EnumDescriptorProto)>;
+type FieldAttributeFn = Box<dyn Fn(&mut dyn fmt::Write, &str, &FieldDescriptorProto)>;
+type OneofAttributeFn = Box<dyn Fn(&mut dyn fmt::Write, &str, &OneofDescriptorProto)>;
+type EnumValueAttributeFn = Box<dyn Fn(&mut dyn fmt::Write, &str, &EnumValueDescriptorProto)>;
+
 /// Configuration options for Protobuf code generation.
 ///
 /// This configuration builder can be used to set non-default code generation options.
@@ -224,8 +233,13 @@ pub struct Config {
     service_generator: Option<Box<dyn ServiceGenerator>>,
     map_type: PathMap<MapType>,
     bytes_type: PathMap<BytesType>,
-    type_attributes: PathMap<String>,
-    field_attributes: PathMap<String>,
+    message_attributes: PathMap<MessageAttributeFn>,
+    enum_attributes: PathMap<EnumAttributeFn>,
+    oneof_attributes: PathMap<OneofAttributeFn>,
+    message_field_attributes: PathMap<FieldAttributeFn>,
+    map_field_attributes: PathMap<FieldAttributeFn>,
+    oneof_field_attributes: PathMap<OneofAttributeFn>,
+    enum_value_attributes: PathMap<EnumValueAttributeFn>,
     prost_types: bool,
     strip_enum_prefix: bool,
     out_dir: Option<PathBuf>,
@@ -365,36 +379,157 @@ impl Config {
         self
     }
 
-    /// Add additional attribute to matched fields.
+    /// Add additional attribute to matched message with a function.
     ///
     /// # Arguments
     ///
-    /// **`path`** - a path matching any number of fields. These fields get the attribute.
-    /// For details about matching fields see [`btree_map`](#method.btree_map).
+    /// **`paths`** - a path matching any number of messages. It works the same way as in
+    /// [`btree_map`](#method.btree_map), just with the field name omitted.
     ///
-    /// **`attribute`** - an arbitrary string that'll be placed before each matched field. The
-    /// expected usage are additional attributes, usually in concert with whole-type
-    /// attributes set with [`type_attribute`](method.type_attribute), but it is not
-    /// checked and anything can be put there.
+    /// **`func`** - a function that takes a tuple `(buf, fq_message_path, desc)` where
     ///
-    /// Note that the calls to this method are cumulative ‒ if multiple paths from multiple calls
-    /// match the same field, the field gets all the corresponding attributes.
+    /// - `buf` is a buffer into which the function must write its attribute
+    /// - `fq_message_path` is the fully qualified path of the message
+    /// - `desc` is a [`DescriptorProto`] describing the message
     ///
     /// # Examples
     ///
     /// ```rust
     /// # let mut config = prost_build::Config::new();
-    /// // Prost renames fields named `in` to `in_`. But if serialized through serde,
-    /// // they should as `in`.
-    /// config.field_attribute("in", "#[serde(rename = \"in\")]");
+    /// use prost_types::field_descriptor_proto::Type;
+    ///
+    /// // Derive `Eq` on any message without a floating point field
+    /// config.message_attribute_with(".", |buf, _path, desc| {
+    ///     let contains_floats = desc
+    ///         .field
+    ///         .iter()
+    ///         .any(|field| field.r#type() == Type::Double && field.r#type() == Type::Float);
+    ///     if !contains_floats {
+    ///         write!(buf, "#[derive(Eq)]").unwrap();
+    ///     }
+    /// });
     /// ```
-    pub fn field_attribute<P, A>(&mut self, path: P, attribute: A) -> &mut Self
+    pub fn message_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
     where
         P: AsRef<str>,
-        A: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &DescriptorProto) + 'static,
     {
-        self.field_attributes
-            .insert(path.as_ref().to_string(), attribute.as_ref().to_string());
+        self.message_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    /// Add additional attribute to matched enum with a function.
+    ///
+    /// # Arguments
+    ///
+    /// **`paths`** - a path matching any number of enums. It works the same way as in
+    /// [`btree_map`](#method.btree_map), just with the field name omitted.
+    ///
+    /// **`func`** - a function that takes a tuple `(buf, fq_message_path, desc)` where
+    ///
+    /// - `buf` is a buffer into which the function must write its attribute
+    /// - `fq_message_path` is the fully qualified path of the enum
+    /// - `desc` is an [`EnumDescriptorProto`] describing the enum
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// // Tell serde to serialize every enum variant as SCREAMING_SNAKE_CASE
+    /// config.enum_attribute_with(".", |buf, _path, _desc| {
+    ///     write!(buf, r#"#[serde(rename_all = "SCREAMING_SNAKE_CASE")]"#)
+    /// });
+    /// ```
+    pub fn enum_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &EnumDescriptorProto) + 'static,
+    {
+        self.enum_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// use prost_types::field_descriptor_proto::Type;
+    ///
+    /// // Tell serde to use a custom (de)serializer for fields of a specific type
+    /// config.message_field_attribute_with(".my.package.CustomMessage", |buf, _, field| {
+    ///     if field.r#type() == Type::Bytes {
+    ///         write!(buf, r#"#[serde(with = "my_custom_serde_for_bytes")]"#).unwrap();
+    ///     }
+    /// });
+    ///
+    /// // Tell serde to serialize fields with their JSON name, if available
+    /// config.message_field_attribute_with(".my.package.CustomMessage", |buf, _, field| {
+    ///     if let Some(json_name) = field.json_name {
+    ///         write!(buf, r#"#[serde(rename = "{}")]"#, json_name).unwrap();
+    ///     }
+    /// });
+    /// ```
+    pub fn message_field_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &FieldDescriptorProto) + 'static,
+    {
+        self.message_field_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    pub fn map_field_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &FieldDescriptorProto) + 'static,
+    {
+        self.map_field_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    pub fn oneof_field_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &OneofDescriptorProto) + 'static,
+    {
+        self.oneof_field_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    pub fn oneof_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &OneofDescriptorProto) + 'static,
+    {
+        self.oneof_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
+        self
+    }
+
+    // TODO method & service
+
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// // Tell serde to serialize enum variants with their protobuf name, instead of
+    /// // their Rust CamelCase name
+    /// config.enum_value_attribute_with(".", |buf, _path, desc| {
+    ///     write!(buf, r#"#[serde(rename = "{}")]"#, desc.name()).unwrap();
+    /// });
+    /// ```
+    pub fn enum_value_attribute_with<P, F>(&mut self, path: P, func: F) -> &mut Self
+    where
+        P: AsRef<str>,
+        F: Fn(&mut dyn fmt::Write, &str, &EnumValueDescriptorProto) + 'static,
+    {
+        self.enum_value_attributes
+            .insert(path.as_ref().to_string(), Box::new(func));
         self
     }
 
@@ -442,8 +577,83 @@ impl Config {
         P: AsRef<str>,
         A: AsRef<str>,
     {
-        self.type_attributes
-            .insert(path.as_ref().to_string(), attribute.as_ref().to_string());
+        let path = path.as_ref();
+        let attribute = std::rc::Rc::new(attribute.as_ref().to_string());
+        self.message_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self.oneof_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self.enum_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self
+    }
+
+    /// Add additional attribute to matched fields.
+    ///
+    /// # Arguments
+    ///
+    /// **`path`** - a path matching any number of fields. These fields get the attribute.
+    /// For details about matching fields see [`btree_map`](#method.btree_map).
+    ///
+    /// **`attribute`** - an arbitrary string that'll be placed before each matched field. The
+    /// expected usage are additional attributes, usually in concert with whole-type
+    /// attributes set with [`type_attribute`](method.type_attribute), but it is not
+    /// checked and anything can be put there.
+    ///
+    /// Note that the calls to this method are cumulative ‒ if multiple paths from multiple calls
+    /// match the same field, the field gets all the corresponding attributes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # let mut config = prost_build::Config::new();
+    /// // Prost renames fields named `in` to `in_`. But if serialized through serde,
+    /// // they should as `in`.
+    /// config.field_attribute("in", "#[serde(rename = \"in\")]");
+    /// ```
+    pub fn field_attribute<P, A>(&mut self, path: P, attribute: A) -> &mut Self
+    where
+        P: AsRef<str>,
+        A: AsRef<str>,
+    {
+        let path = path.as_ref();
+        let attribute = std::rc::Rc::new(attribute.as_ref().to_string());
+        self.message_field_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self.map_field_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self.oneof_field_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
+        self.enum_value_attribute_with(path.clone(), {
+            let attribute = attribute.clone();
+            move |buf, _, _| {
+                buf.write_str(attribute.as_ref()).unwrap();
+            }
+        });
         self
     }
 
@@ -996,8 +1206,13 @@ impl default::Default for Config {
             service_generator: None,
             map_type: PathMap::default(),
             bytes_type: PathMap::default(),
-            type_attributes: PathMap::default(),
-            field_attributes: PathMap::default(),
+            message_attributes: PathMap::default(),
+            enum_attributes: PathMap::default(),
+            oneof_attributes: PathMap::default(),
+            message_field_attributes: PathMap::default(),
+            map_field_attributes: PathMap::default(),
+            oneof_field_attributes: PathMap::default(),
+            enum_value_attributes: PathMap::default(),
             prost_types: true,
             strip_enum_prefix: true,
             out_dir: None,
@@ -1018,8 +1233,13 @@ impl fmt::Debug for Config {
             .field("service_generator", &self.service_generator.is_some())
             .field("map_type", &self.map_type)
             .field("bytes_type", &self.bytes_type)
-            .field("type_attributes", &self.type_attributes)
-            .field("field_attributes", &self.field_attributes)
+            // .field("message_attributes", &self.message_attributes)
+            // .field("enum_attributes", &self.enum_attributes)
+            // .field("oneof_attributes", &self.oneof_attributes)
+            // .field("message_field_attributes", &self.message_field_attributes)
+            // .field("map_field_attributes", &self.map_field_attributes)
+            // .field("oneof_field_attributes", &self.oneof_field_attributes)
+            // .field("enum_value_attributes", &self.enum_value_attributes)
             .field("prost_types", &self.prost_types)
             .field("strip_enum_prefix", &self.strip_enum_prefix)
             .field("out_dir", &self.out_dir)

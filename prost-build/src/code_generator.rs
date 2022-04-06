@@ -18,6 +18,7 @@ use crate::ast::{Comments, Method, Service};
 use crate::extern_paths::ExternPaths;
 use crate::ident::{to_snake, to_upper_camel};
 use crate::message_graph::MessageGraph;
+use crate::path::PathMap;
 use crate::{BytesType, Config, MapType};
 
 #[derive(PartialEq)]
@@ -142,7 +143,7 @@ impl<'a> CodeGenerator<'a> {
         type MapTypes = HashMap<String, (FieldDescriptorProto, FieldDescriptorProto)>;
         let (nested_types, map_types): (NestedTypes, MapTypes) = message
             .nested_type
-            .into_iter()
+            .iter()
             .enumerate()
             .partition_map(|(idx, nested_type)| {
                 if nested_type
@@ -159,7 +160,7 @@ impl<'a> CodeGenerator<'a> {
                     let name = format!("{}.{}", &fq_message_name, nested_type.name());
                     Either::Right((name, (key, value)))
                 } else {
-                    Either::Left((nested_type, idx))
+                    Either::Left((nested_type.clone(), idx))
                 }
             });
 
@@ -169,20 +170,26 @@ impl<'a> CodeGenerator<'a> {
         type OneofFields = MultiMap<i32, (FieldDescriptorProto, usize)>;
         let (fields, mut oneof_fields): (Fields, OneofFields) = message
             .field
-            .into_iter()
+            .iter()
             .enumerate()
             .partition_map(|(idx, field)| {
                 if field.proto3_optional.unwrap_or(false) {
-                    Either::Left((field, idx))
+                    Either::Left((field.clone(), idx))
                 } else if let Some(oneof_index) = field.oneof_index {
-                    Either::Right((oneof_index, (field, idx)))
+                    Either::Right((oneof_index, (field.clone(), idx)))
                 } else {
-                    Either::Left((field, idx))
+                    Either::Left((field.clone(), idx))
                 }
             });
 
         self.append_doc(&fq_message_name, None);
-        self.append_type_attributes(&fq_message_name);
+        append_type_attributes(
+            self.buf,
+            self.depth,
+            &fq_message_name,
+            &message,
+            &self.config.message_attributes,
+        );
         self.push_indent();
         self.buf
             .push_str("#[derive(Clone, PartialEq, ::prost::Message)]\n");
@@ -257,28 +264,6 @@ impl<'a> CodeGenerator<'a> {
             }
 
             self.pop_mod();
-        }
-    }
-
-    fn append_type_attributes(&mut self, fq_message_name: &str) {
-        assert_eq!(b'.', fq_message_name.as_bytes()[0]);
-        for attribute in self.config.type_attributes.get(fq_message_name) {
-            push_indent(&mut self.buf, self.depth);
-            self.buf.push_str(&attribute);
-            self.buf.push('\n');
-        }
-    }
-
-    fn append_field_attributes(&mut self, fq_message_name: &str, field_name: &str) {
-        assert_eq!(b'.', fq_message_name.as_bytes()[0]);
-        for attribute in self
-            .config
-            .field_attributes
-            .get_field(fq_message_name, field_name)
-        {
-            push_indent(&mut self.buf, self.depth);
-            self.buf.push_str(&attribute);
-            self.buf.push('\n');
         }
     }
 
@@ -384,7 +369,14 @@ impl<'a> CodeGenerator<'a> {
         }
 
         self.buf.push_str("\")]\n");
-        self.append_field_attributes(fq_message_name, field.name());
+        append_field_attributes(
+            self.buf,
+            self.depth,
+            fq_message_name,
+            field.name(),
+            &field,
+            &self.config.message_field_attributes,
+        );
         self.push_indent();
         self.buf.push_str("pub ");
         self.buf.push_str(&to_snake(field.name()));
@@ -443,7 +435,14 @@ impl<'a> CodeGenerator<'a> {
             value_tag,
             field.number()
         ));
-        self.append_field_attributes(fq_message_name, field.name());
+        append_field_attributes(
+            self.buf,
+            self.depth,
+            fq_message_name,
+            field.name(),
+            &field,
+            &self.config.map_field_attributes,
+        );
         self.push_indent();
         self.buf.push_str(&format!(
             "pub {}: {}<{}, {}>,\n",
@@ -476,7 +475,14 @@ impl<'a> CodeGenerator<'a> {
                 .map(|&(ref field, _)| field.number())
                 .join(", ")
         ));
-        self.append_field_attributes(fq_message_name, oneof.name());
+        append_field_attributes(
+            self.buf,
+            self.depth,
+            fq_message_name,
+            oneof.name(),
+            oneof,
+            &self.config.oneof_field_attributes,
+        );
         self.push_indent();
         self.buf.push_str(&format!(
             "pub {}: ::core::option::Option<{}>,\n",
@@ -499,7 +505,13 @@ impl<'a> CodeGenerator<'a> {
         self.path.pop();
 
         let oneof_name = format!("{}.{}", fq_message_name, oneof.name());
-        self.append_type_attributes(&oneof_name);
+        append_type_attributes(
+            self.buf,
+            self.depth,
+            &oneof_name,
+            &oneof,
+            &self.config.oneof_attributes,
+        );
         self.push_indent();
         self.buf
             .push_str("#[derive(Clone, PartialEq, ::prost::Oneof)]\n");
@@ -524,7 +536,14 @@ impl<'a> CodeGenerator<'a> {
                 ty_tag,
                 field.number()
             ));
-            self.append_field_attributes(&oneof_name, field.name());
+            append_field_attributes(
+                self.buf,
+                self.depth,
+                &oneof_name,
+                field.name(),
+                &field,
+                &self.config.message_field_attributes,
+            );
 
             self.push_indent();
             let ty = self.resolve_type(&field, fq_message_name);
@@ -600,7 +619,13 @@ impl<'a> CodeGenerator<'a> {
         }
 
         self.append_doc(&fq_enum_name, None);
-        self.append_type_attributes(&fq_enum_name);
+        append_type_attributes(
+            self.buf,
+            self.depth,
+            &fq_enum_name,
+            &desc,
+            &self.config.enum_attributes,
+        );
         self.push_indent();
         self.buf.push_str(
             "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]\n",
@@ -646,7 +671,14 @@ impl<'a> CodeGenerator<'a> {
         prefix_to_strip: Option<String>,
     ) {
         self.append_doc(fq_enum_name, Some(value.name()));
-        self.append_field_attributes(fq_enum_name, &value.name());
+        append_field_attributes(
+            self.buf,
+            self.depth,
+            fq_enum_name,
+            value.name(),
+            value,
+            &self.config.enum_value_attributes,
+        );
         self.push_indent();
         let name = to_upper_camel(value.name());
         let name_unprefixed = match prefix_to_strip {
@@ -986,6 +1018,37 @@ fn unescape_c_escape_string(s: &str) -> Vec<u8> {
         }
     }
     dst
+}
+
+fn append_type_attributes<Desc>(
+    buf: &mut String,
+    depth: u8,
+    fq_type_name: &str,
+    desc: &Desc,
+    attributes: &PathMap<Box<dyn Fn(&mut dyn std::fmt::Write, &str, &Desc)>>,
+) {
+    assert_eq!(b'.', fq_type_name.as_bytes()[0]);
+    for attribute in attributes.get(fq_type_name) {
+        push_indent(buf, depth);
+        attribute(buf, fq_type_name, desc);
+        buf.push('\n');
+    }
+}
+
+fn append_field_attributes<Desc>(
+    buf: &mut String,
+    depth: u8,
+    fq_type_name: &str,
+    field_name: &str,
+    desc: &Desc,
+    attributes: &PathMap<Box<dyn Fn(&mut dyn std::fmt::Write, &str, &Desc)>>,
+) {
+    assert_eq!(b'.', fq_type_name.as_bytes()[0]);
+    for attribute in attributes.get_field(fq_type_name, field_name) {
+        push_indent(buf, depth);
+        attribute(buf, fq_type_name, desc);
+        buf.push('\n');
+    }
 }
 
 /// Strip an enum's type name from the prefix of an enum value.
